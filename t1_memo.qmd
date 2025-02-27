@@ -1,0 +1,277 @@
+---
+format: pdf
+editor: visual
+freeze: true
+---
+
+```{r, echo = FALSE, include = FALSE}
+
+# CREATIION OF ALTERNATIVE SCENARIO
+
+library(here)
+library(tidyverse)
+set.seed(12345)
+
+# load population & employment dbs
+pop_db <- read_csv(here("model",
+                        "inputs",
+                        "zonal",
+                        "ma_population_run97-176_2019_v20240109.csv"))
+
+emp_db <- read_csv(here("model",
+                        "inputs",
+                        "zonal",
+                        "ma_employment_run97-176_2019_v20240109.csv"))
+
+# identify low income population
+mod_pop_db <- pop_db |>
+  filter(is_worker==1) |>
+  mutate(low_inc = case_when(wage_inc < 20000 ~ 1,
+                              TRUE ~ 0))
+
+# whole construction sector disappears
+disapp <- sum(emp_db$`1_constr`)
+
+# disappeared as share of low income population -- assumes all construction workers are low-income for simplicity
+disapp_in_low_inc <- disapp/sum(mod_pop_db$low_inc)
+disapp_in_total <- disapp/sum(pop_db$persons)
+
+# random disappearance status assignment 
+mod_pop_db <- mod_pop_db |>
+  filter(low_inc == 1) |>
+  mutate(disapp =  rbinom(n(), size = 1, prob = disapp_in_low_inc)) |>
+  mutate(unique_id = paste0(hid, person_num)) |>
+  select(unique_id, disapp)
+
+# join database
+pop_db <- pop_db |>
+  mutate(unique_id = paste0(hid, person_num)) |>
+  left_join(mod_pop_db, by = "unique_id") |>
+  mutate(disapp = replace_na(disapp, 0))
+
+# exclude disapp in final db
+pop_db_alternative <- pop_db |>
+  filter(disapp == 0) |>
+  select(-unique_id, -disapp)
+
+# new household count per block
+household_per_block <- pop_db_alternative |>
+  group_by(block_id) |>
+  summarise(total_households_new = n_distinct(hid)) 
+
+# join database and eliminate disapp employment in construction
+emp_db_alternative <- emp_db |>
+  select(-total_households) |>
+  left_join(household_per_block, by = "block_id") |>
+  mutate(total_households = replace_na(total_households_new,0)) |>
+  select(-total_households_new) |>
+  mutate(`1_constr`=0) |>
+  mutate(total_jobs = rowSums(across(2:11)))
+
+# write csvs
+write_csv(emp_db_alternative, here("model", "inputs", "zonal", "ma_employment_alternative.csv"))
+
+write_csv(pop_db_alternative, here("model", "inputs", "zonal", "ma_population_alternative.csv"))
+```
+
+```{r, echo = FALSE, include = FALSE}
+
+#COMPARISON OF BASE AND ALTERNATIVE SCENARIOS
+
+library(RSQLite)
+library(here)
+library(tidyverse)
+
+base_SQL <- dbConnect(drv=RSQLite::SQLite(), 
+                     dbname=here("model",
+                                 "outputs",
+                                 "Base",
+                                 "tdm23.db"))
+
+base_db <- dbGetQuery(base_SQL, 'SELECT * FROM veh') |>
+  select(-num_vehs) |>
+  rename(base_veh_suff = veh_suff)
+
+dbDisconnect(base_SQL)
+
+alt_SQL <- dbConnect(drv=RSQLite::SQLite(), 
+                     dbname=here("model",
+                                 "outputs",
+                                 "Alternative",
+                                 "tdm23.db"))
+
+alt_db <- dbGetQuery(alt_SQL, 'SELECT * FROM veh') |>
+  select(-num_vehs, -block_id) |>
+  rename(alt_veh_suff = veh_suff)
+
+dbDisconnect(alt_SQL)
+
+merged_db <- base_db |>
+  left_join(alt_db, by = "hid") |>
+  mutate(change = case_when(base_veh_suff == alt_veh_suff ~ FALSE,
+                            TRUE ~ TRUE)) |>
+  mutate(new_sv = case_when(change == TRUE & alt_veh_suff == "sv" ~ 1,
+                            TRUE ~ 0)) |>
+  mutate(new_iv = case_when(change == TRUE & alt_veh_suff == "iv" ~ 1,
+                            TRUE ~ 0)) |>
+  mutate(new_zv = case_when(change == TRUE & alt_veh_suff == "zv" ~ 1,
+                            TRUE ~ 0)) |>
+  mutate(dissapeared = case_when(change == TRUE & is.na(alt_veh_suff) ~ 1,
+                            TRUE ~ 0)) |>
+  mutate(downgrade = case_when(base_veh_suff == "sv" & alt_veh_suff == "iv" ~ 1,
+                               base_veh_suff == "sv" & alt_veh_suff == "zv" ~ 1,
+                               base_veh_suff == "iv" & alt_veh_suff == "zv" ~ 1,
+                               is.na(alt_veh_suff) ~ 1,
+                               TRUE ~ 0)) |>
+  mutate(upgrade = case_when(base_veh_suff == "iv" & alt_veh_suff == "sv" ~ 1,
+                               base_veh_suff == "zv" & alt_veh_suff == "iv" ~ 1,
+                               base_veh_suff == "zv" & alt_veh_suff == "sv" ~ 1,
+                               TRUE ~ 0))
+
+results_db <- merged_db |>
+  summarise(n_hhs = n(),
+            n_new_zv = sum(new_zv),
+            n_new_iv = sum(new_iv),
+            n_new_sv = sum(new_sv),
+            n_disappeared = sum(dissapeared),
+            n_downgrade = sum(downgrade),
+            n_upgrade = sum(upgrade),
+            n_change = sum(change))
+
+results_perc_db <- merged_db |>
+  summarise(n_hhs = n()/n()*100,
+            n_new_zv = sum(new_zv)/n()*100,
+            n_new_iv = sum(new_iv)/n()*100,
+            n_new_sv = sum(new_sv)/n()*100,
+            n_disappeared = sum(dissapeared)/n()*100,
+            n_downgrade = sum(downgrade)/n()*100,
+            n_upgrade = sum(upgrade)/n()*100,
+            n_change = sum(change)/n()*100)
+
+results_byblock_db <- merged_db |>
+  group_by(block_id) |>
+  summarise(n_hhs = n(),
+            n_new_zv = sum(new_zv),
+            n_new_iv = sum(new_iv),
+            n_new_sv = sum(new_sv),
+            n_downgrade = sum(downgrade),
+            n_upgrade = sum(upgrade),
+            n_disappeared = sum(dissapeared),
+            n_change = sum(change))
+```
+
+# SES 5394: Travel Behaviour and Forecasting - T1 Memorandum
+
+**From:** Abraham Majluf, Isabella Tice, Rubén Figueroa
+
+**To:** Carole Voulgaris, Course Instructor
+
+**Date:** 26.02.2025
+
+**RE:** Impact of disappearance of construction workers in vehicle availability according to the Boston Region Metropolitan Planning Organization’s regional travel demand model (TDM23)
+
+**Note:** Relevant datasets and code that were use used to produce the analysis summarized in this memo can be found at [GitHub](https://github.com/amajlufr/ses5394_t1).
+
+------------------------------------------------------------------------
+
+The purpose of this memo is to communicate changes in household vehicle availability through simulated changes in population and employment in the study area. In particular, through the disappearance of all 176,818 construction workers, virtually representing around 0.8% of the whole population in the study area. These were assumed to be low-income for simplicity. This analysis was performed according to the Boston Region Metropolitan Planning Organization’s regional travel demand model (TDM23).
+
+#### Key Findings
+
+-   The disappearance of construction workers (0.8% of the population) impacted vehicle availability in 26.6% of households–approximately 969.9K households.
+
+-   There is an approximate equal distribution between those who were downgraded and upgraded (\~13.3% each), being those upgraded marginally superior.
+
+#### Analysis Assumptions
+
+-   Working population with income below 20K USD annually was classified as low-income population.
+
+-   All construction workers were assumed to be low-income for simplicity, representing around 17.7% of this income group.
+
+-   Within the defined low-income population, a Bernoulli distribution with parameter circa 17.7% was applied to select disappearance status to be extracted.
+
+-   After extraction of construction workers, household population was recalculated. This also led to the disappearance of 13,194 single-person households (around 0.8% of total households).
+
+-   Disappearance of construction workers was assumed to represent disappearance of corresponding jobs (no substitution).
+
+#### Results Details
+
+The following table summarizes the impact of the proposed changes in household vehicle availability:
+
+```{r, echo = FALSE, include = TRUE, message=FALSE}
+library(knitr)
+library(scales)
+
+rbind(results_db, results_perc_db) |>
+  mutate(Type = c("Absolute", "Percentage")) |>
+  rename("Households" = n_hhs,
+         "New Zero-Vehicle" = n_new_zv,
+         "New Insufficient-Vehicle" = n_new_iv,
+         "New Sufficient-Vehicle" = n_new_sv,
+         "Disappeared" = n_disappeared,
+         "Downgrade" = n_downgrade,
+         "Upgrade" = n_upgrade,
+         "Total Change" = n_change) |> 
+  mutate(across(-Type, ~ ifelse(Type == "Absolute", comma(.), percent(. / 100, accuracy = 0.01)))) |>
+  select(Type, everything()) |>
+  t() |>
+  kable(format = "latex", caption = "Changes in Alternative vs Base Scenario", align = c("l", "r", "r"), position = "h!")
+```
+
+Out of 3,486,270 households, approximately 926,898 (26.59%) experienced some form of change. Notably, 133,883 (3.84%) households transitioned to having no vehicles, while 336,515 (9.65%) now have an insufficient number of vehicles. Conversely, 443,306 (12.72%) households gained a sufficient number of vehicles. Additionally, a small fraction, 13,194 (0.38%), disappeared as they represented one-person households.
+
+Changes in vehicle ownership are nearly balanced between those upgrading and downgrading: 462,928 (13.28%) households downgraded their vehicle count, while 463,970 (13.31%) upgraded. The overall distribution highlights significant movement in household vehicle access, with more than a quarter of households adjusting their status.
+
+The following map shows the spatial distribution of change for the study area.
+
+```{r, echo = FALSE, include = FALSE, message=FALSE}
+library(sf)
+library(here)
+library(leaflet)
+library(maptiles)
+library(tidyterra)
+library(tigris)
+
+blocks <- blocks(state = "MA",
+                          year = 2010,
+                          progress_bar = FALSE) |>
+  left_join(merged_db, by=c("GEOID10"="block_id")) |> 
+  filter(!is.na(change)) |>
+  st_centroid() |> 
+  mutate(up_down = case_when(
+    upgrade == 1 ~ "1",  # Blue (Upgrade)
+    downgrade == 1 ~ "2",  # Red (Downgrade)
+    TRUE ~ "0"  # Transparent (Neither)
+  ))
+
+base_map <- get_tiles(blocks,
+                      provider = "CartoDB.Positron",
+                      zoom = 8,
+                      crop = TRUE)
+```
+
+```{r, echo = FALSE, include = FALSE, message=FALSE}
+library(sf)
+library(here)
+library(leaflet)
+library(maptiles)
+library(tidyterra)
+library(tigris)
+
+pic <- ggplot(data = blocks) +
+      geom_spatraster_rgb(data = base_map) +  
+      geom_sf(aes(color = factor(up_down)), size = 0.1, shape = 16) +
+      scale_color_manual(values = c("0" = "gray", "1" = "blue", "2" = "red"), 
+                         labels = c("No change", "Upgrade", "Downgrade"),
+                         name = "Change status") +
+      guides(color = guide_legend(override.aes = list(size = 3))) +
+      theme_minimal()
+
+ggsave("map.png", plot = pic, width = 10, height = 6, dpi = 300)
+```
+
+![Figure 1. Spatial distribution of changes in blocks](map.png)
+
+The color patterns in the map show a mixture of gray, blue, and red points distributed across Massachusetts. Gray points are the most prevalent, appearing consistently across the entire area, indicating a large portion of unchanged households. Blue and red points are interspersed throughout, with varying densities in different regions. In some areas, blue points seem to cluster together, while in others, red points appear more dominant. However, both colors are spread across urban, suburban, and rural areas without forming clear, uniform trends.
+
+There are regions where blue and red points are densely packed, creating a blended effect, while other areas show a more sparse distribution of changes. The transition between colors does not follow a distinct pattern, as clusters of blue or red can appear in proximity to each other or among gray points. Some locations show a higher concentration of one color, but there is no clear gradient or directional shift. Instead, the map presents a scattered distribution of changes in vehicle ownership across different parts of the state.
